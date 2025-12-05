@@ -1,4 +1,4 @@
-# verison 0.1 Not implemented ttl logic
+# verison 0.1 Not implemented ttl logic, Filtering using exact match (expressions not implemented)
 
 import aerospike
 from datetime import datetime, timezone
@@ -14,6 +14,7 @@ from langgraph.store.base import (
     SearchItem,
     SearchOp,
     TTLConfig,
+    MatchCondition
 )
 from collections.abc import Iterable
 from typing import (
@@ -55,7 +56,41 @@ class AerospikeStore(BaseStore):
             self.client.put(key, bins)
         except aerospike.exception.AerospikeError as e:
             raise RuntimeError(f"Aerospike put failed for {key}: {e}") from e
-        
+    
+    def _scan_records(self):
+        scan = self.client.scan(self.ns, self.set)
+        records = scan.results()
+        return [bins for (_k, _m, bins) in records]
+    
+    @staticmethod
+    def _match_prefix(ns: tuple[str, ...], prefix: NamespacePath) -> bool:
+        if len(ns) < len(prefix):
+            return False
+        length = len(prefix)
+        i = 0
+        while i < length:
+            if prefix[i] == "*":
+                i += 1
+                continue
+            if ns[i] != prefix[i]:
+                return False
+            i += 1
+        return True
+    
+    @staticmethod
+    def _match_suffix(ns: tuple[str, ...], suffix: NamespacePath) -> bool:
+        if len(ns) < len(suffix):
+            return False
+        start_pointer = len(ns) - len(suffix)
+        while start_pointer < len(suffix):
+            if suffix[start_pointer] == "*":
+                start_pointer += 1
+                continue
+            if ns[start_pointer] != suffix[start_pointer]:
+                return False
+            start_pointer += 1
+        return True
+    
     def write(self, op: PutOp):
 
         key = self._key(op.namespace, op.key)
@@ -108,6 +143,66 @@ class AerospikeStore(BaseStore):
             updated_at= updated_at
         )
     
+    def list_namespaces(
+        self,
+        *,
+        prefix: NamespacePath | None = None,
+        suffix: NamespacePath | None = None,
+        max_depth: int | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[tuple[str, ...]]:
+        """List and filter namespaces in the store.
+
+        Used to explore the organization of data,
+        find specific collections, or navigate the namespace hierarchy.
+
+        Args:
+            prefix: Filter namespaces that start with this path.
+            suffix: Filter namespaces that end with this path.
+            max_depth: Return namespaces up to this depth in the hierarchy.
+                Namespaces deeper than this level will be truncated.
+            limit: Maximum number of namespaces to return.
+            offset: Number of namespaces to skip for pagination.
+
+        Returns:
+            A list of namespace tuples that match the criteria. Each tuple represents a
+                full namespace path up to `max_depth`.
+
+        ???+ example "Examples":
+
+            Setting `max_depth=3`. Given the namespaces:
+
+            ```python
+            # Example if you have the following namespaces:
+            # ("a", "b", "c")
+            # ("a", "b", "d", "e")
+            # ("a", "b", "d", "i")
+            # ("a", "b", "f")
+            # ("a", "c", "f")
+            store.list_namespaces(prefix=("a", "b"), max_depth=3)
+            # [("a", "b", "c"), ("a", "b", "d"), ("a", "b", "f")]
+            ```
+        """
+        bins_list = self._scan_records()
+        all_namespaces: list[tuple[str, ...]] = set()
+        for bins in bins_list:
+            ns = tuple(bins.get("namespace", ()))
+            if prefix and not self._match_prefix(ns= ns, prefix=prefix):
+                continue
+            if suffix and not self._match_suffix(ns= ns, suffix= suffix):
+                continue
+
+            if max_depth is not None:
+                ns = ns[: max_depth]
+            all_namespaces.add(ns)
+        all_namespaces_list = list(all_namespaces)
+        if offset:
+            all_namespaces_list = all_namespaces_list[offset:]
+        if limit:
+            all_namespaces_list = all_namespaces_list[: limit]
+        return all_namespaces_list
+    
     def search(
         self,
         namespace_prefix: tuple[str, ...],
@@ -125,9 +220,49 @@ class AerospikeStore(BaseStore):
                 "Aerospike v0.1 does not support semantic/vector search. "
                 "Use search without query. "
             )
-        
+        bins_list = self._scan_records()
+        out: list[SearchItem] = []
 
-        pass
+        for bins in bins_list:
+            ns = tuple(bins.get("namespace", ()))
+            if not ns:
+                continue
+            if namespace_prefix and not self._match_prefix(ns, prefix= namespace_prefix):
+                continue
+
+            key = bins.get("key")
+            value = bins.get("value")
+
+            if key is None or value is None:
+                continue
+
+            if filter:
+                include = True
+                for f_key, f_value in filter.items():
+                    if value.get(f_key) != f_value:
+                        include = False
+                        break
+                if not include:
+                    continue
+
+            created_at = bins.get("created_at", _now_utc().isoformat())
+            updated_at = bins.get("updated_at", _now_utc().isoformat())
+
+            out.append(SearchItem(
+                namespace= ns,
+                key= key,
+                value= value,
+                created_at= created_at,
+                updated_at= updated_at,
+                score= None
+            ))
+
+        if offset:
+            out = out[offset:]
+        if limit is not None:
+            out = out[:limit]
+
+        return out
 
     def batch(self, ops: Iterable[Op]) -> list[Result]:
         """Execute multiple operations synchronously in a single batch.
@@ -156,10 +291,37 @@ class AerospikeStore(BaseStore):
                 result.append(None)
 
             elif isinstance(op, SearchOp):
-                result.append(self._search(op))
+                result.append(
+                    self.search(
+                        namespace_prefix = op.namespace_prefix,
+                        filter= op.filter,
+                        limit= op.limit,
+                        offset= op.offset
+                    )
+                )
 
             elif isinstance(op, ListNamespacesOp):
-                result.append(self._listnamespaces(op))
+                prefix = None
+                suffix = None
+                if op.match_conditions:
+                    for condition in op.match_conditions:
+                        if condition.match_type == "prefix":
+                            prefix = condition.path
+                        elif condition.match_type == "suffix":
+                            suffix = condition.path
+                        else:
+                            raise ValueError(
+                                f"Match type {condition.match_type} must be prefix or suffix."
+                            )
+                result.append(
+                    self.list_namespaces(
+                        prefix= prefix,
+                        suffix= suffix,
+                        max_depth= op.max_depth,
+                        limit= op.limit,
+                        offset= op.offset
+                    )
+                )
             else:
                 raise TypeError(f'Unsupported operation type: {type(op)}')
             
