@@ -1,6 +1,7 @@
 # verison 0.1 Not implemented ttl logic, Filtering using exact match (expressions not implemented)
 
 import aerospike
+from aerospike_helpers import expressions as exp
 from datetime import datetime, timezone
 from langgraph.store.base import (
     BaseStore,
@@ -25,8 +26,6 @@ from typing import (
 
 # Initializing params and helper Methods
 
-
-
 SEP = "|"
 
 def _now_utc() -> datetime:
@@ -49,7 +48,7 @@ class AerospikeStore(BaseStore):
     
     # --------------- Helper Functions ------------------
     def _key(self, namespace: tuple[str, ...], key: str) -> str:
-        return (self.ns, self.set, {SEP}.join([*namespace, key]))
+        return (self.ns, self.set, SEP.join([*namespace, key]))
     
     def _put(self, key, bins: Dict[str, Any]) -> None:
         try:
@@ -57,39 +56,45 @@ class AerospikeStore(BaseStore):
         except aerospike.exception.AerospikeError as e:
             raise RuntimeError(f"Aerospike put failed for {key}: {e}") from e
     
-    def _scan_records(self):
-        scan = self.client.scan(self.ns, self.set)
-        records = scan.results()
-        return [bins for (_k, _m, bins) in records]
+    def _get_type_result(self, value: Any):
+        """Helper to determine the Aerospike ResultType based on Python value type."""
+        if isinstance(value, int):
+            return exp.ResultType.INTEGER
+        elif isinstance(value, float):
+            return exp.ResultType.FLOAT
+        elif isinstance(value, str):
+            return exp.ResultType.STRING
+        elif isinstance(value, bytes):
+            return exp.ResultType.BLOB
+        elif isinstance(value, (dict, list)):
+            return exp.ResultType.MAP if isinstance(value, dict) else exp.ResultType.LIST
+        return exp.ResultType.STRING
     
-    @staticmethod
-    def _match_prefix(ns: tuple[str, ...], prefix: NamespacePath) -> bool:
-        if len(ns) < len(prefix):
-            return False
-        length = len(prefix)
-        i = 0
-        while i < length:
-            if prefix[i] == "*":
-                i += 1
+    def _build_path_filter(self, path: NamespacePath, bin_name: str, is_suffix: bool = False) -> list:
+        """
+        Builds a list of expressions to handle wildcards in NamespacePath.
+        """
+        conditions = []
+        path_len = len(path)
+        size_check = exp.Ge(
+            exp.ListSize(None, exp.ListBin(bin_name)), 
+            exp.Val(path_len)
+        )
+        conditions.append(size_check)
+        for i, token in enumerate(path):
+            if token == "*":
                 continue
-            if ns[i] != prefix[i]:
-                return False
-            i += 1
-        return True
-    
-    @staticmethod
-    def _match_suffix(ns: tuple[str, ...], suffix: NamespacePath) -> bool:
-        if len(ns) < len(suffix):
-            return False
-        start_pointer = len(ns) - len(suffix)
-        while start_pointer < len(suffix):
-            if suffix[start_pointer] == "*":
-                start_pointer += 1
-                continue
-            if ns[start_pointer] != suffix[start_pointer]:
-                return False
-            start_pointer += 1
-        return True
+            if is_suffix:
+                algo_index = i - path_len
+            else:
+                algo_index = i
+            match_condition = exp.Eq(
+                exp.ListGetByIndex(None, aerospike.LIST_RETURN_VALUE, algo_index, exp.ListBin(bin_name)),
+                exp.Val(token)
+            )
+            conditions.append(match_condition)
+            
+        return conditions
     
     def write(self, op: PutOp):
 
@@ -184,18 +189,31 @@ class AerospikeStore(BaseStore):
             # [("a", "b", "c"), ("a", "b", "d"), ("a", "b", "f")]
             ```
         """
-        bins_list = self._scan_records()
+        filter_exprs = []
+        if prefix:
+            prefix_conditions = self._build_path_filter(prefix, "namespace", is_suffix=False)
+            filter_exprs.extend(prefix_conditions)
+        if suffix:
+            suffix_conditions = self._build_path_filter(suffix, "namespace", is_suffix=True)
+            filter_exprs.extend(suffix_conditions)
+        
+        policy = {}
+        if filter_exprs:
+            final_expr = exp.And(*filter_exprs)
+            policy["filter_expression"] = final_expr.compile()
+        try:
+            scan = self.client.scan(self.ns, self.set)
+            records = scan.results(policy=policy)
+        except aerospike.exception.AerospikeError as e:
+            raise RuntimeError(f"Aerospike search failed: {e}") from e
+        
         all_namespaces: list[tuple[str, ...]] = set()
-        for bins in bins_list:
+        for _, _, bins in records:
             ns = tuple(bins.get("namespace", ()))
-            if prefix and not self._match_prefix(ns= ns, prefix=prefix):
-                continue
-            if suffix and not self._match_suffix(ns= ns, suffix= suffix):
-                continue
-
             if max_depth is not None:
                 ns = ns[: max_depth]
             all_namespaces.add(ns)
+
         all_namespaces_list = list(all_namespaces)
         if offset:
             all_namespaces_list = all_namespaces_list[offset:]
@@ -220,31 +238,38 @@ class AerospikeStore(BaseStore):
                 "Aerospike v0.1 does not support semantic/vector search. "
                 "Use search without query. "
             )
-        bins_list = self._scan_records()
+        
+        filter_exprs = []
+        if namespace_prefix:
+            prefix_conditions = self._build_path_filter(namespace_prefix, "namespace", is_suffix=False)
+            filter_exprs.extend(prefix_conditions)
+
+        if filter:
+            for key, val in filter.items():
+                result_type = self._get_type_result(val)
+                expr_map_check = exp.Eq(
+                    exp.MapGetByKey(None, aerospike.MAP_RETURN_VALUE, result_type, key, exp.MapBin("value")),
+                    exp.Val(val)
+                )
+                filter_exprs.append(expr_map_check)
+        policy = {}
+        if filter_exprs:
+            final_expr = exp.And(*filter_exprs)
+            policy["filter_expression"] = final_expr.compile()
+        
+        try:
+            scan = self.client.scan(self.ns, self.set)
+            records = scan.results(policy=policy)
+        except aerospike.exception.AerospikeError as e:
+            raise RuntimeError(f"Aerospike search failed: {e}") from e
+        
         out: list[SearchItem] = []
+        
 
-        for bins in bins_list:
+        for _, _, bins in records:
             ns = tuple(bins.get("namespace", ()))
-            if not ns:
-                continue
-            if namespace_prefix and not self._match_prefix(ns, prefix= namespace_prefix):
-                continue
-
             key = bins.get("key")
             value = bins.get("value")
-
-            if key is None or value is None:
-                continue
-
-            if filter:
-                include = True
-                for f_key, f_value in filter.items():
-                    if value.get(f_key) != f_value:
-                        include = False
-                        break
-                if not include:
-                    continue
-
             created_at = bins.get("created_at", _now_utc().isoformat())
             updated_at = bins.get("updated_at", _now_utc().isoformat())
 
