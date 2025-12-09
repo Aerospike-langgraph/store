@@ -1,6 +1,7 @@
 # verison 0.1 Not implemented ttl logic, Filtering using exact match (expressions not implemented)
 
 import aerospike
+from aerospike_helpers import expressions as exp
 from datetime import datetime, timezone
 from langgraph.store.base import (
     BaseStore,
@@ -22,10 +23,9 @@ from typing import (
     Dict,
     Any
 )
-
+from aerospike_helpers import expressions as exp
+from langgraph.store.base import NamespacePath
 # Initializing params and helper Methods
-
-
 
 SEP = "|"
 
@@ -49,7 +49,7 @@ class AerospikeStore(BaseStore):
     
     # --------------- Helper Functions ------------------
     def _key(self, namespace: tuple[str, ...], key: str) -> str:
-        return (self.ns, self.set, {SEP}.join([*namespace, key]))
+        return (self.ns, self.set, SEP.join([*namespace, key]))
     
     def _put(self, key, bins: Dict[str, Any]) -> None:
         try:
@@ -57,39 +57,59 @@ class AerospikeStore(BaseStore):
         except aerospike.exception.AerospikeError as e:
             raise RuntimeError(f"Aerospike put failed for {key}: {e}") from e
     
-    def _scan_records(self):
-        scan = self.client.scan(self.ns, self.set)
-        records = scan.results()
-        return [bins for (_k, _m, bins) in records]
+    def _get_type_result(self, value: Any):
+        """Helper to determine the Aerospike ResultType based on Python value type."""
+        if isinstance(value, int):
+            return exp.ResultType.INTEGER
+        elif isinstance(value, float):
+            return exp.ResultType.FLOAT
+        elif isinstance(value, str):
+            return exp.ResultType.STRING
+        elif isinstance(value, bytes):
+            return exp.ResultType.BLOB
+        elif isinstance(value, (dict, list)):
+            return exp.ResultType.MAP if isinstance(value, dict) else exp.ResultType.LIST
+        return exp.ResultType.STRING
     
-    @staticmethod
-    def _match_prefix(ns: tuple[str, ...], prefix: NamespacePath) -> bool:
-        if len(ns) < len(prefix):
-            return False
-        length = len(prefix)
-        i = 0
-        while i < length:
-            if prefix[i] == "*":
-                i += 1
-                continue
-            if ns[i] != prefix[i]:
-                return False
-            i += 1
-        return True
-    
-    @staticmethod
-    def _match_suffix(ns: tuple[str, ...], suffix: NamespacePath) -> bool:
-        if len(ns) < len(suffix):
-            return False
-        start_pointer = len(ns) - len(suffix)
-        while start_pointer < len(suffix):
-            if suffix[start_pointer] == "*":
-                start_pointer += 1
-                continue
-            if ns[start_pointer] != suffix[start_pointer]:
-                return False
-            start_pointer += 1
-        return True
+    def _build_path_filter(
+        self,
+        path: NamespacePath,
+        bin_name: str,
+        is_suffix: bool = False,
+    ) -> list:
+        """
+        Builds a list of expressions to handle wildcards in NamespacePath.
+        For example, prefix/suffix matching on the 'namespace' bin.
+        """
+        conditions: list = []
+        path_len = len(path)
+
+        # Require: len(namespace) >= len(path)
+        size_check = exp.GE(  # <- was Ge
+            exp.ListSize(None, exp.ListBin(bin_name)),
+            exp.Val(path_len),
+        )
+        conditions.append(size_check)
+
+        # For each element in the prefix/suffix, ensure equality
+        for idx, part in enumerate(path):
+            # Position from start or end
+            pos = -(idx + 1) if is_suffix else idx
+
+            elem_expr = exp.Eq(  # <- was Eq in some versions
+                exp.ListGetByIndex(
+                    None,
+                    aerospike.LIST_RETURN_VALUE,
+                    exp.ResultType.STRING,
+                    exp.Val(pos),
+                    exp.ListBin(bin_name),
+                ),
+                exp.Val(part),
+            )
+            conditions.append(elem_expr)
+
+        return conditions
+    # --------------- Core Functions --------------------
     
     def write(self, op: PutOp):
 
@@ -102,18 +122,20 @@ class AerospikeStore(BaseStore):
             return
         
         now = _now_utc()
+        now_str = _now_utc().isoformat()
         try:
-            old_key, old_meta, old_bins = self.client.get(key)
-            created_at = old_bins.get("created_at", now)
-        except aerospike.exception.AerospikeError as e:
-            created_at = now
+            _, _, old_bins = self.client.get(key)
+            # If an old created_at exists, keep it; otherwise use now_str
+            created_at = old_bins.get("created_at") or now_str
+        except aerospike.exception.AerospikeError:
+            created_at = now_str
 
         bins = {
             "namespace": list(op.namespace),
             "key": op.key,
             "value": op.value,
             "created_at": created_at,
-            "updated_at": now,
+            "updated_at": now_str,
 
         }
         self._put(key, bins)
@@ -142,7 +164,7 @@ class AerospikeStore(BaseStore):
             created_at= created_at,
             updated_at= updated_at
         )
-    
+
     def list_namespaces(
         self,
         *,
@@ -184,24 +206,58 @@ class AerospikeStore(BaseStore):
             # [("a", "b", "c"), ("a", "b", "d"), ("a", "b", "f")]
             ```
         """
-        bins_list = self._scan_records()
-        all_namespaces: list[tuple[str, ...]] = set()
-        for bins in bins_list:
-            ns = tuple(bins.get("namespace", ()))
-            if prefix and not self._match_prefix(ns= ns, prefix=prefix):
-                continue
-            if suffix and not self._match_suffix(ns= ns, suffix= suffix):
+        filter_exprs = []
+        if prefix:
+            prefix_conditions = self._build_path_filter(prefix, "namespace", is_suffix=False)
+            filter_exprs.extend(prefix_conditions)
+        if suffix:
+            suffix_conditions = self._build_path_filter(suffix, "namespace", is_suffix=True)
+            filter_exprs.extend(suffix_conditions)
+        
+        policy: dict[str, Any] = {}
+        if filter_exprs:
+            final_expr = exp.And(*filter_exprs)
+            policy["filter_expression"] = final_expr.compile()
+
+        try:
+            scan = self.client.scan(self.ns, self.set)
+            records = scan.results(policy=policy)
+            # if policy:
+            #     records = scan.results(policy)
+            # else:
+            #     records = scan.results()
+        except aerospike.exception.AerospikeError as e:
+            raise RuntimeError(f"Aerospike list_namespaces failed: {e}") from e
+
+        all_namespaces: set[tuple[str, ...]] = set()
+        for _, _, bins in records:
+            ns_list = bins.get("namespace")
+            if not ns_list:
                 continue
 
+            ns = tuple(ns_list)
+
+            # apply max_depth truncation
             if max_depth is not None:
-                ns = ns[: max_depth]
+                ns = ns[:max_depth]
+
+            # (Safety) re-apply prefix/suffix checks in Python
+            if prefix is not None and ns[: len(prefix)] != prefix:
+                continue
+            if suffix is not None and ns[-len(suffix) :] != suffix:
+                continue
+
             all_namespaces.add(ns)
-        all_namespaces_list = list(all_namespaces)
+
+        # ---- 4. Convert to list, sort, and slice for offset/limit ----
+        ns_list = sorted(all_namespaces)
+
         if offset:
-            all_namespaces_list = all_namespaces_list[offset:]
-        if limit:
-            all_namespaces_list = all_namespaces_list[: limit]
-        return all_namespaces_list
+            ns_list = ns_list[offset:]
+        if limit is not None:
+            ns_list = ns_list[:limit]
+
+        return ns_list
     
     def search(
         self,
@@ -220,31 +276,38 @@ class AerospikeStore(BaseStore):
                 "Aerospike v0.1 does not support semantic/vector search. "
                 "Use search without query. "
             )
-        bins_list = self._scan_records()
+        
+        filter_exprs = []
+        if namespace_prefix:
+            prefix_conditions = self._build_path_filter(namespace_prefix, "namespace", is_suffix=False)
+            filter_exprs.extend(prefix_conditions)
+
+        if filter:
+            for key, val in filter.items():
+                result_type = self._get_type_result(val)
+                expr_map_check = exp.Eq(
+                    exp.MapGetByKey(None, aerospike.MAP_RETURN_VALUE, result_type, key, exp.MapBin("value")),
+                    exp.Val(val)
+                )
+                filter_exprs.append(expr_map_check)
+        policy = {}
+        if filter_exprs:
+            final_expr = exp.And(*filter_exprs)
+            policy["filter_expression"] = final_expr.compile()
+        
+        try:
+            scan = self.client.scan(self.ns, self.set)
+            records = scan.results(policy=policy)
+        except aerospike.exception.AerospikeError as e:
+            raise RuntimeError(f"Aerospike search failed: {e}") from e
+        
         out: list[SearchItem] = []
+        
 
-        for bins in bins_list:
+        for _, _, bins in records:
             ns = tuple(bins.get("namespace", ()))
-            if not ns:
-                continue
-            if namespace_prefix and not self._match_prefix(ns, prefix= namespace_prefix):
-                continue
-
             key = bins.get("key")
             value = bins.get("value")
-
-            if key is None or value is None:
-                continue
-
-            if filter:
-                include = True
-                for f_key, f_value in filter.items():
-                    if value.get(f_key) != f_value:
-                        include = False
-                        break
-                if not include:
-                    continue
-
             created_at = bins.get("created_at", _now_utc().isoformat())
             updated_at = bins.get("updated_at", _now_utc().isoformat())
 
@@ -264,45 +327,104 @@ class AerospikeStore(BaseStore):
 
         return out
 
+    # def batch(self, ops: Iterable[Op]) -> list[Result]:
+    #     """Execute multiple operations synchronously in a single batch.
+
+    #     Args:
+    #         ops: An iterable of operations to execute.
+
+    #     Returns:
+    #         A list of results, where each result corresponds to an operation in the input.
+    #         The order of results matches the order of input operations.
+    #     """
+    #     result: list[Result] = []
+    #     dedeup_puts: dict[tuple[NamespacePath, str], PutOp] = {}
+
+    #     for op in ops:
+    #         # result : list[Result] = []
+    #         # dedeup_puts: dict[tuple[tuple[str, ...]], PutOp] = {}
+
+    #         if isinstance(op, GetOp):
+    #             result.append(
+    #                 self.get(
+    #                     namespace=op.namespace, 
+    #                     key=op.key
+    #                 )
+    #             )
+
+    #         elif isinstance(op, PutOp):
+    #             dedeup_puts[(op.namespace, op.key)] = op
+    #             result.append(None)
+
+    #         elif isinstance(op, SearchOp):
+    #             result.append(
+    #                 self.search(op)
+    #                 # self.search(
+    #                 #     namespace_prefix = op.namespace_prefix,
+    #                 #     filter= op.filter,
+    #                 #     limit= op.limit,
+    #                 #     offset= op.offset
+    #                 # )
+    #             )
+
+    #         elif isinstance(op, ListNamespacesOp):
+    #             prefix: NamespacePath | None = None
+    #             suffix: NamespacePath | None = None
+    #             if op.match_conditions:
+    #                 for condition in op.match_conditions:
+    #                     if condition.match_type == "prefix":
+    #                         prefix = condition.path
+    #                     elif condition.match_type == "suffix":
+    #                         suffix = condition.path
+    #                     else:
+    #                         raise ValueError(
+    #                             f"Match type {condition.match_type} must be prefix or suffix."
+    #                         )
+    #             result.append(
+    #                 self.list_namespaces(
+    #                     prefix= prefix,
+    #                     suffix= suffix,
+    #                     max_depth= op.max_depth,
+    #                     limit= op.limit,
+    #                     offset= op.offset
+    #                 )
+    #             )
+    #         else:
+    #             raise TypeError(f'Unsupported operation type: {type(op)}')
+            
+    #     for put_op in dedeup_puts.values():                             # Does bulk write here makes sense?? For Faster Write.
+    #         self.write(put_op)
+
+    #     return result
     def batch(self, ops: Iterable[Op]) -> list[Result]:
-        """Execute multiple operations synchronously in a single batch.
+        """Execute a batch of operations sequentially.
 
-        Args:
-            ops: An iterable of operations to execute.
-
-        Returns:
-            A list of results, where each result corresponds to an operation in the input.
-            The order of results matches the order of input operations.
+        Returns a list of results aligned with `ops`:
+        - PutOp -> None
+        - GetOp -> Item | None
+        - SearchOp -> list[SearchItem]
+        - ListNamespacesOp -> list[NamespacePath]
         """
+        results: list[Result] = []
+
         for op in ops:
-            result : list[Result] = []
-            dedeup_puts: dict[tuple[tuple[str, ...]], PutOp] = {}
+            if isinstance(op, PutOp):
+                # Write immediately so later ops see it
+                self.write(op)
+                results.append(None)
 
-            if isinstance(op, GetOp):
-                result.append(
-                    self.get(
-                        namespace=op.namespace, 
-                        key=op.key
-                    )
-                )
-
-            elif isinstance(op, PutOp):
-                dedeup_puts[(op.namespace, op.key)] = op
-                result.append(None)
+            elif isinstance(op, GetOp):
+                item = self.get(op.namespace, op.key)
+                results.append(item)
 
             elif isinstance(op, SearchOp):
-                result.append(
-                    self.search(
-                        namespace_prefix = op.namespace_prefix,
-                        filter= op.filter,
-                        limit= op.limit,
-                        offset= op.offset
-                    )
-                )
+                search_results = self.search(op)
+                results.append(search_results)
 
             elif isinstance(op, ListNamespacesOp):
-                prefix = None
-                suffix = None
+                prefix: NamespacePath | None = None
+                suffix: NamespacePath | None = None
+
                 if op.match_conditions:
                     for condition in op.match_conditions:
                         if condition.match_type == "prefix":
@@ -313,23 +435,20 @@ class AerospikeStore(BaseStore):
                             raise ValueError(
                                 f"Match type {condition.match_type} must be prefix or suffix."
                             )
-                result.append(
-                    self.list_namespaces(
-                        prefix= prefix,
-                        suffix= suffix,
-                        max_depth= op.max_depth,
-                        limit= op.limit,
-                        offset= op.offset
-                    )
+
+                ns_list = self.list_namespaces(
+                    prefix=prefix,
+                    suffix=suffix,
+                    max_depth=op.max_depth,
+                    limit=op.limit,
+                    offset=op.offset,
                 )
+                results.append(ns_list)
+
             else:
-                raise TypeError(f'Unsupported operation type: {type(op)}')
-            
-            for put_op in dedeup_puts.values():                             # Does bulk write here makes sense?? For Faster Write.
-                self.write(put_op)
+                raise TypeError(f"Unsupported operation type: {type(op)}")
 
-            return result
-
+        return results
 
 
     async def abatch(self, ops: Iterable[Op]) -> list[Result]:
@@ -344,4 +463,3 @@ class AerospikeStore(BaseStore):
         """
         pass
     pass
-
