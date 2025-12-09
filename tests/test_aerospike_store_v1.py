@@ -27,16 +27,17 @@ def test_list_namespaces(store):
 def test_search(store):
     cleanup(store)
     ns = ("demo", "user3")
-    store.write(PutOp(namespace=ns, key="x", value={"type": "chat", "user": "u3"}))
-    store.write(PutOp(namespace=ns, key="y", value={"type": "chat", "user": "u3"}))
-    res = store.search(SearchOp(namespace_prefix=("demo", "user3")))
-    assert len(res) == 2
-    filtered = store.search(
-        SearchOp(
+    store.batch([PutOp(namespace=ns, key="x", value={"type": "chat", "user": "u3"})])
+    store.batch([PutOp(namespace=ns, key="y", value={"type": "chat", "user": "u3"})])
+    res = store.batch([SearchOp(namespace_prefix=("demo", "user3"))])
+    print(len(res[0]))
+    assert len(res[0]) == 2
+    filtered = store.batch(
+        [SearchOp(
             namespace_prefix=("demo",),
             filter={"type": "chat"},
-    ))
-    assert len(filtered) == 2
+    )])
+    assert len(filtered[0]) == 2
 def test_batch(store):
     cleanup(store)
     ns = ("demo", "user4")

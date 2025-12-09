@@ -28,8 +28,9 @@ import time
 
 SEP = "|"
 
-def _now_utc() -> int:
-    return time.time_ns()
+
+def _now_utc() -> datetime:
+    return datetime.now(tz=timezone.utc)
 
 # Base class
 
@@ -107,7 +108,7 @@ class AerospikeStore(BaseStore):
                 raise RuntimeError(f"Aerospike remove failed for {key}: {e}") from e
             return
         
-        now = _now_utc()
+        now = _now_utc().isoformat()
         try:
             old_key, old_meta, old_bins = self.client.get(key)
             created_at = old_bins.get("created_at", now)
@@ -130,7 +131,7 @@ class AerospikeStore(BaseStore):
         try:
             _, _, bins = self.client.get(pkey)
         except aerospike.exception.AerospikeError as e:
-            raise RuntimeError(f"Aerospike get failed for {key}: {e}") from e
+            return None
         
         ns = tuple(bins.get("namespace", namespace))
         k = bins.get("key", key)
@@ -138,8 +139,8 @@ class AerospikeStore(BaseStore):
         if value is None:
             return None
         
-        created_at = bins.get("created_at", _now_utc())
-        updated_at = bins.get("updated_at", _now_utc())
+        created_at = bins.get("created_at", _now_utc().isoformat())
+        updated_at = bins.get("updated_at", _now_utc().isoformat())
         
         return Item(
             value= value,
@@ -314,13 +315,14 @@ class AerospikeStore(BaseStore):
                 )
 
             elif isinstance(op, PutOp):
-                dedeup_puts[(op.namespace, op.key)] = op
+                #dedeup_puts[(op.namespace, op.key)] = op
+                self.write(op= op)
                 result.append(None)
 
             elif isinstance(op, SearchOp):
                 result.append(
                     self.search(
-                        namespace_prefix = op.namespace_prefix,
+                        op.namespace_prefix,
                         filter= op.filter,
                         limit= op.limit,
                         offset= op.offset
