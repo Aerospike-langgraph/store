@@ -23,13 +23,13 @@ from typing import (
     Dict,
     Any
 )
-
+import time
 # Initializing params and helper Methods
 
 SEP = "|"
 
-def _now_utc() -> datetime:
-    return datetime.now(tz=timezone.utc)
+def _now_utc() -> int:
+    return time.time_ns()
 
 # Base class
 
@@ -76,7 +76,7 @@ class AerospikeStore(BaseStore):
         """
         conditions = []
         path_len = len(path)
-        size_check = exp.Ge(
+        size_check = exp.GE(
             exp.ListSize(None, exp.ListBin(bin_name)), 
             exp.Val(path_len)
         )
@@ -88,8 +88,9 @@ class AerospikeStore(BaseStore):
                 algo_index = i - path_len
             else:
                 algo_index = i
+            result_type = self._get_type_result(token)
             match_condition = exp.Eq(
-                exp.ListGetByIndex(None, aerospike.LIST_RETURN_VALUE, algo_index, exp.ListBin(bin_name)),
+                exp.ListGetByIndex(None, aerospike.LIST_RETURN_VALUE, result_type, exp.Val(algo_index), exp.ListBin(bin_name)),
                 exp.Val(token)
             )
             conditions.append(match_condition)
@@ -137,8 +138,8 @@ class AerospikeStore(BaseStore):
         if value is None:
             return None
         
-        created_at = bins.get("created_at", _now_utc().isoformat())
-        updated_at = bins.get("updated_at", _now_utc().isoformat())
+        created_at = bins.get("created_at", _now_utc())
+        updated_at = bins.get("updated_at", _now_utc())
         
         return Item(
             value= value,
@@ -197,13 +198,15 @@ class AerospikeStore(BaseStore):
             suffix_conditions = self._build_path_filter(suffix, "namespace", is_suffix=True)
             filter_exprs.extend(suffix_conditions)
         
+        print(filter_exprs)
         policy = {}
         if filter_exprs:
             final_expr = exp.And(*filter_exprs)
-            policy["filter_expression"] = final_expr.compile()
+            policy["expressions"] = final_expr.compile()
         try:
             scan = self.client.scan(self.ns, self.set)
-            records = scan.results(policy=policy)
+            records = scan.results(policy= policy)
+            print(f"Length of records {len(records)}")
         except aerospike.exception.AerospikeError as e:
             raise RuntimeError(f"Aerospike search failed: {e}") from e
         
@@ -255,7 +258,7 @@ class AerospikeStore(BaseStore):
         policy = {}
         if filter_exprs:
             final_expr = exp.And(*filter_exprs)
-            policy["filter_expression"] = final_expr.compile()
+            policy["expressions"] = final_expr.compile()
         
         try:
             scan = self.client.scan(self.ns, self.set)
@@ -270,8 +273,8 @@ class AerospikeStore(BaseStore):
             ns = tuple(bins.get("namespace", ()))
             key = bins.get("key")
             value = bins.get("value")
-            created_at = bins.get("created_at", _now_utc().isoformat())
-            updated_at = bins.get("updated_at", _now_utc().isoformat())
+            created_at = bins.get("created_at", _now_utc())
+            updated_at = bins.get("updated_at", _now_utc())
 
             out.append(SearchItem(
                 namespace= ns,
@@ -299,10 +302,9 @@ class AerospikeStore(BaseStore):
             A list of results, where each result corresponds to an operation in the input.
             The order of results matches the order of input operations.
         """
+        result : list[Result] = []
+        dedeup_puts: dict[tuple[tuple[str, ...]], PutOp] = {}
         for op in ops:
-            result : list[Result] = []
-            dedeup_puts: dict[tuple[tuple[str, ...]], PutOp] = {}
-
             if isinstance(op, GetOp):
                 result.append(
                     self.get(
@@ -350,10 +352,10 @@ class AerospikeStore(BaseStore):
             else:
                 raise TypeError(f'Unsupported operation type: {type(op)}')
             
-            for put_op in dedeup_puts.values():                             # Does bulk write here makes sense?? For Faster Write.
-                self.write(put_op)
+        for put_op in dedeup_puts.values():                             # Does bulk write here makes sense?? For Faster Write.
+            self.write(put_op)
 
-            return result
+        return result
 
 
 
