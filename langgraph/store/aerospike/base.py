@@ -15,13 +15,16 @@ from langgraph.store.base import (
     SearchItem,
     SearchOp,
     TTLConfig,
-    MatchCondition
+    MatchCondition,
+    NOT_PROVIDED,
+    NotProvided
 )
 from collections.abc import Iterable
 from typing import (
     Optional,
     Dict,
-    Any
+    Any,
+    Literal
 )
 import time
 # Initializing params and helper Methods
@@ -35,31 +38,45 @@ def _now_utc() -> datetime:
 # Base class
 
 class AerospikeStore(BaseStore):
-    supports_ttl: bool = False
+    supports_ttl: bool = True
     def __init__(
         self,
         client : aerospike.Client,
         namespace : str = "langgraph",
         set : str = "store",
-        ttl: Optional[int] = None
+        ttl_config: Optional[TTLConfig] = None
     ) -> None:
         self.client = client
         self.ns = namespace
         self.set = set
+        self.ttl_config = ttl_config
     
     # --------------- Helper Functions ------------------
     def _key(self, namespace: tuple[str, ...], key: str) -> str:
         return (self.ns, self.set, SEP.join([*namespace, key]))
     
-    def _put(self, key, bins: Dict[str, Any]) -> None:
+    def _put(self, key, bins: Dict[str, Any], ttl: Optional[int]) -> None:
         try:
-            self.client.put(key, bins)
+            if ttl is not None:
+                self.client.put(key, bins, {"ttl": ttl})
+            else:
+                self.client.put(key, bins)
         except aerospike.exception.AerospikeError as e:
             raise RuntimeError(f"Aerospike put failed for {key}: {e}") from e
+        
+    def _build_read_policy_for_refresh(self, refresh_ttl: bool | None) -> dict[str, Any]:
+        policy: dict[str, Any] = {}
+        if self.ttl_config is not None and self.ttl_config.get("refresh_on_read"):
+            policy["read_touch_ttl_percent"] = 100
+        if refresh_ttl:
+            policy["read_touch_ttl_percent"] = 100
+        return policy
     
     def _get_type_result(self, value: Any):
         """Helper to determine the Aerospike ResultType based on Python value type."""
-        if isinstance(value, int):
+        if isinstance(value, bool):
+            return exp.ResultType.BOOLEAN
+        elif isinstance(value, int):
             return exp.ResultType.INTEGER
         elif isinstance(value, float):
             return exp.ResultType.FLOAT
@@ -70,6 +87,21 @@ class AerospikeStore(BaseStore):
         elif isinstance(value, (dict, list)):
             return exp.ResultType.MAP if isinstance(value, dict) else exp.ResultType.LIST
         return exp.ResultType.STRING
+    
+    def _get_op_expression(self, bin_expr, value_expr, operator: str):
+        ops = {
+            "$eq": exp.Eq,
+            "$ne": exp.NE,
+            "$gt": exp.GT,
+            "$gte": exp.GE,
+            "$lt": exp.LT,
+            "$lte": exp.LE,
+        }
+        
+        if operator not in ops:
+            raise ValueError(f"Unsupported operator: {operator}")
+            
+        return ops[operator](bin_expr, value_expr)
     
     def _build_path_filter(self, path: NamespacePath, bin_name: str, is_suffix: bool = False) -> list:
         """
@@ -98,38 +130,142 @@ class AerospikeStore(BaseStore):
             
         return conditions
     
-    def write(self, op: PutOp):
-
-        key = self._key(op.namespace, op.key)
-        if op.value is None:
+    def _build_filter_exprs_from_dict(self, filter_dict: dict[str, Any]) -> list:
+        filter_exprs = []
+        
+        for key, condition in filter_dict.items():
+            map_key_expr = exp.Val(key)
+            if isinstance(condition, dict) and any(k.startswith("$") for k in condition.keys()):
+                
+                for op, val in condition.items():
+                    result_type = self._get_type_result(val)
+                    target_expr = exp.MapGetByKey(
+                        None, 
+                        aerospike.MAP_RETURN_VALUE, 
+                        result_type, 
+                        map_key_expr, 
+                        exp.MapBin("value")
+                    )
+                    
+                    op_expr = self._get_op_expression(target_expr, exp.Val(val), op)
+                    filter_exprs.append(op_expr)
+            
+            else:
+                result_type = self._get_type_result(condition)
+                target_expr = exp.MapGetByKey(
+                    None, 
+                    aerospike.MAP_RETURN_VALUE, 
+                    result_type, 
+                    map_key_expr, 
+                    exp.MapBin("value")
+                )
+                filter_exprs.append(exp.Eq(target_expr, exp.Val(condition)))
+                
+        return filter_exprs
+    
+    # --------------- Base Functions --------------------
+    
+    def put(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+        value: dict[str, Any],
+        index: Literal[False] | list[str] | None = None,
+        *,
+        ttl: float | None | NotProvided = NOT_PROVIDED,
+    ) -> None:
+        p_key = self._key(namespace, key)
+        if value is None:
             try:
-                self.client.remove(key)
+                self.client.remove(p_key)
             except aerospike.exception.AerospikeError as e:
                 raise RuntimeError(f"Aerospike remove failed for {key}: {e}") from e
             return
         
         now = _now_utc().isoformat()
         try:
-            old_key, old_meta, old_bins = self.client.get(key)
+            _, _, old_bins = self.client.get(p_key)
             created_at = old_bins.get("created_at", now)
         except aerospike.exception.AerospikeError as e:
             created_at = now
+        
+        time_to_live: Optional[int] = None
+        if ttl is None:
+            time_to_live = -1
+        elif ttl is not NOT_PROVIDED:
+            if ttl < 0:
+                time_to_live = -1
+            else: time_to_live = int(ttl * 60)
+        else:
+            if self.ttl_config is not None:
+                default_ttl_minutes = self.ttl_config.get("default_ttl", None)
+                if default_ttl_minutes is not None:
+                    time_to_live = int(default_ttl_minutes * 60)
+            
 
         bins = {
-            "namespace": list(op.namespace),
-            "key": op.key,
-            "value": op.value,
+            "namespace": list(namespace),
+            "key": key,
+            "value": value,
             "created_at": created_at,
             "updated_at": now,
 
-        }
-        self._put(key, bins)
+        }                                                                           # Should we append here or just update
+        self._put(p_key, bins, time_to_live)
+        
+    
+    # def write(self, op: PutOp):
 
-    # --------------- Base Functions --------------------
-    def get(self, namespace: tuple[str, ...], key: str) -> Item | None:
+    #     key = self._key(op.namespace, op.key)
+    #     if op.value is None:
+    #         try:
+    #             self.client.remove(key)
+    #         except aerospike.exception.AerospikeError as e:
+    #             raise RuntimeError(f"Aerospike remove failed for {key}: {e}") from e
+    #         return
+        
+    #     now = _now_utc().isoformat()
+    #     try:
+    #         _, _, old_bins = self.client.get(key)
+    #         created_at = old_bins.get("created_at", now)
+    #     except aerospike.exception.AerospikeError as e:
+    #         created_at = now
+        
+    #     ttl: Optional[int] = None
+    #     if self.ttl_config is not None:
+    #         default_ttl_minutes = self.ttl_config.get("default_ttl", None)
+    #         if default_ttl_minutes is not None:
+    #             ttl = int(default_ttl_minutes * 60)
+    #     if op.ttl is not None:
+    #         if op.ttl < 0:
+    #             ttl = -1
+    #         else: ttl = int(op.ttl * 60)
+
+    #     bins = {
+    #         "namespace": list(op.namespace),
+    #         "key": op.key,
+    #         "value": op.value,
+    #         "created_at": created_at,
+    #         "updated_at": now,
+
+    #     }                                                                           # Should we append here or just update
+    #     self._put(key, bins, ttl)
+
+    def get(
+        self, 
+        namespace: tuple[str, ...], 
+        key: str,
+        *,
+        refresh_ttl: bool | None = None,
+    ) -> Item | None:
         pkey = self._key(namespace= namespace, key= key)
+        
+        read_policy = self._build_read_policy_for_refresh(refresh_ttl)
         try:
-            _, _, bins = self.client.get(pkey)
+            if read_policy:
+                _, _, bins = self.client.get(pkey, policy= read_policy)
+            else:
+                _, _, bins = self.client.get(pkey)
         except aerospike.exception.AerospikeError as e:
             return None
         
@@ -199,7 +335,6 @@ class AerospikeStore(BaseStore):
             suffix_conditions = self._build_path_filter(suffix, "namespace", is_suffix=True)
             filter_exprs.extend(suffix_conditions)
         
-        print(filter_exprs)
         policy = {}
         if filter_exprs:
             final_expr = exp.And(*filter_exprs)
@@ -249,13 +384,9 @@ class AerospikeStore(BaseStore):
             filter_exprs.extend(prefix_conditions)
 
         if filter:
-            for key, val in filter.items():
-                result_type = self._get_type_result(val)
-                expr_map_check = exp.Eq(
-                    exp.MapGetByKey(None, aerospike.MAP_RETURN_VALUE, result_type, key, exp.MapBin("value")),
-                    exp.Val(val)
-                )
-                filter_exprs.append(expr_map_check)
+            filter_conditions = self._build_filter_exprs_from_dict(filter)
+            filter_exprs.extend(filter_conditions)
+
         policy = {}
         if filter_exprs:
             final_expr = exp.And(*filter_exprs)
@@ -267,10 +398,16 @@ class AerospikeStore(BaseStore):
         except aerospike.exception.AerospikeError as e:
             raise RuntimeError(f"Aerospike search failed: {e}") from e
         
+        read_policy = self._build_read_policy_for_refresh(refresh_ttl)
         out: list[SearchItem] = []
         
 
         for _, _, bins in records:
+            if read_policy:
+                try:
+                    _, _, bins = self.client.get(key, policy=read_policy)                  # Is there any better way??
+                except aerospike.exception.AerospikeError:
+                    continue
             ns = tuple(bins.get("namespace", ()))
             key = bins.get("key")
             value = bins.get("value")
@@ -304,7 +441,7 @@ class AerospikeStore(BaseStore):
             The order of results matches the order of input operations.
         """
         result : list[Result] = []
-        dedeup_puts: dict[tuple[tuple[str, ...]], PutOp] = {}
+        # dedeup_puts: dict[tuple[tuple[str, ...]], PutOp] = {}
         for op in ops:
             if isinstance(op, GetOp):
                 result.append(
@@ -316,7 +453,13 @@ class AerospikeStore(BaseStore):
 
             elif isinstance(op, PutOp):
                 #dedeup_puts[(op.namespace, op.key)] = op
-                self.write(op= op)
+                #self.write(op=op)
+                self.put(
+                    namespace= op.namespace,
+                    key= op.key,
+                    value= op.value,
+                    ttl= op.ttl
+                )
                 result.append(None)
 
             elif isinstance(op, SearchOp):
@@ -354,8 +497,13 @@ class AerospikeStore(BaseStore):
             else:
                 raise TypeError(f'Unsupported operation type: {type(op)}')
             
-        for put_op in dedeup_puts.values():                             # Does bulk write here makes sense?? For Faster Write.
-            self.write(put_op)
+        # for put_op in dedeup_puts.values():                             # Does bulk write here makes sense?? For Faster Write.
+        #     self.put(
+        #         namespace= put_op.namespace,
+        #         key= put_op.key,
+        #         value= put_op.value,
+        #         ttl= put_op.ttl
+        #     )
 
         return result
 
@@ -371,6 +519,8 @@ class AerospikeStore(BaseStore):
             A list of results, where each result corresponds to an operation in the input.
             The order of results matches the order of input operations.
         """
+
+        # Should use Aerospike batch ops
         pass
     pass
 
