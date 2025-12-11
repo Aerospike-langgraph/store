@@ -119,7 +119,7 @@ def test_search_exact_match(store):
     # Search for status=draft
     search_op = SearchOp(
         namespace_prefix=ns,
-        filter={"status": "draft"},
+        filter={"status": {"$eq": "draft"}},
         limit=10
     )
     results = store.batch([search_op])[0]
@@ -157,3 +157,130 @@ def test_list_namespaces(store):
     assert len(results) == 2
     assert ("root", "branch_a", "leaf_1") in results
     assert ("root", "branch_a", "leaf_2") in results
+
+def test_search_numeric_operators(store):
+    """Test $gt, $lt, $gte, $lte with integers."""
+    ns = ("game", "scores")
+    
+    # Setup data
+    ops = [
+        PutOp(namespace=ns, key="p1", value={"score": 10, "rank": "C"}),
+        PutOp(namespace=ns, key="p2", value={"score": 20, "rank": "B"}),
+        PutOp(namespace=ns, key="p3", value={"score": 30, "rank": "A"}),
+        PutOp(namespace=ns, key="p4", value={"score": 40, "rank": "S"}),
+    ]
+    store.batch(ops)
+
+    # 1. Test Greater Than ($gt)
+    # Expect scores > 20 -> 30, 40
+    res_gt = store.batch([SearchOp(
+        namespace_prefix=ns,
+        filter={"score": {"$gt": 20}}
+    )])[0]
+    assert len(res_gt) == 2
+    assert {item.value["score"] for item in res_gt} == {30, 40}
+
+    # 2. Test Less Than or Equal ($lte)
+    # Expect scores <= 20 -> 10, 20
+    res_lte = store.batch([SearchOp(
+        namespace_prefix=ns,
+        filter={"score": {"$lte": 20}}
+    )])[0]
+    assert len(res_lte) == 2
+    assert {item.value["score"] for item in res_lte} == {10, 20}
+
+def test_search_float_comparisons(store):
+    """Test comparisons with floating point numbers to ensure type inference works."""
+    ns = ("sensors", "temp")
+    
+    ops = [
+        PutOp(namespace=ns, key="t1", value={"temperature": 98.6}),
+        PutOp(namespace=ns, key="t2", value={"temperature": 100.5}),
+        PutOp(namespace=ns, key="t3", value={"temperature": 102.1}),
+    ]
+    store.batch(ops)
+
+    # Test Greater Than with Float
+    # Note: It is crucial that the input filter value (100.0) is a float 
+    # so the Store infers exp.ResultType.FLOAT
+    res_float = store.batch([SearchOp(
+        namespace_prefix=ns,
+        filter={"temperature": {"$gt": 100.0}}
+    )])[0]
+    
+    assert len(res_float) == 2
+    assert {item.key for item in res_float} == {"t2", "t3"}
+
+def test_search_not_equal(store):
+    """Test the $ne operator."""
+    ns = ("catalog", "fruits")
+    
+    ops = [
+        PutOp(namespace=ns, key="f1", value={"color": "red", "type": "apple"}),
+        PutOp(namespace=ns, key="f2", value={"color": "yellow", "type": "banana"}),
+        PutOp(namespace=ns, key="f3", value={"color": "red", "type": "strawberry"}),
+    ]
+    store.batch(ops)
+
+    # Search for anything that is NOT red
+    res_ne = store.batch([SearchOp(
+        namespace_prefix=ns,
+        filter={"color": {"$ne": "red"}}
+    )])[0]
+
+    assert len(res_ne) == 1
+    assert res_ne[0].value["type"] == "banana"
+
+def test_search_multiple_conditions(store):
+    """Test combining multiple keys (Implicit AND)."""
+    ns = ("hr", "employees")
+    
+    ops = [
+        # Match matches department but not active
+        PutOp(namespace=ns, key="e1", value={"dept": "engineering", "active": False, "years": 5}),
+        # Match matches active but not department
+        PutOp(namespace=ns, key="e2", value={"dept": "sales", "active": True, "years": 5}),
+        # Matches Both
+        PutOp(namespace=ns, key="e3", value={"dept": "engineering", "active": True, "years": 2}),
+        # Matches Both Dept/Active but fails Years condition
+        PutOp(namespace=ns, key="e4", value={"dept": "engineering", "active": True, "years": 10}),
+    ]
+    store.batch(ops)
+
+    # Filter: Engineering AND Active AND Years < 5
+    search_filter = {
+        "dept": "engineering",
+        "active": True,
+        "years": {"$lt": 5}
+    }
+
+    results = store.batch([SearchOp(
+        namespace_prefix=ns,
+        filter=search_filter
+    )])[0]
+
+    assert len(results) == 1
+    assert results[0].key == "e3"
+
+def test_search_mixed_operators_on_same_field(store):
+    """Test range queries (e.g., 10 < price < 20) if supported by the implementation structure."""
+    # Note: Your implementation iterates over keys. If a user provides:
+    # {"price": {"$gt": 10, "$lt": 20}}
+    # Your loop `for op, val in condition.items()` handles both $gt and $lt for the same key.
+    
+    ns = ("shop", "items")
+    ops = [
+        PutOp(namespace=ns, key="i1", value={"price": 5}),
+        PutOp(namespace=ns, key="i2", value={"price": 15}),
+        PutOp(namespace=ns, key="i3", value={"price": 25}),
+    ]
+    store.batch(ops)
+
+    # Range query: 10 < price < 20
+    results = store.batch([SearchOp(
+        namespace_prefix=ns,
+        filter={"price": {"$gt": 10, "$lt": 20}}
+    )])[0]
+
+    assert len(results) == 1
+    assert results[0].value["price"] == 15
