@@ -30,3 +30,29 @@ def store(client, namespace):
         namespace=namespace,
         set="store_test",
     )
+
+@pytest.fixture()
+def store_with_vector(client, namespace):
+    """Create an AerospikeStore with vector search capabilities."""
+    from langgraph.store.aerospike.base import AerospikeStore
+    
+    # Simple embedding function for testing
+    def simple_embed(texts: list[str]) -> list[list[float]]:
+        """Simple embedding function for testing (returns dummy vectors)."""
+        embeddings = []
+        for text in texts:
+            # Simple deterministic embedding: use character codes
+            vec = [float(ord(c) % 10) / 10.0 for c in (text + "0" * 128)[:128]]
+            embeddings.append(vec)
+        return embeddings
+    
+    return AerospikeStore(
+        client=client,
+        namespace=namespace,
+        set="store_vector_test",
+        index={
+            "dims": 128,
+            "embed": simple_embed,
+            "fields": ["$"]  # Embed entire document by default
+        }
+    )
