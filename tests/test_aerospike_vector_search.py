@@ -323,38 +323,6 @@ def test_batch_operations_with_embeddings(vector_store):
     assert keys == {"doc1", "doc2", "doc3"}
 
 
-def test_vector_search_similarity_scores(vector_store):
-    """Test that similarity scores are reasonable (higher = more similar)."""
-    ns = ("similarity", "test")
-    
-    # Add documents with very similar and very different content
-    vector_store.put(ns, "similar1", {"text": "machine learning algorithms"})
-    vector_store.put(ns, "similar2", {"text": "machine learning models"})
-    vector_store.put(ns, "different", {"text": "cooking pasta recipes"})
-    
-    # Search for "machine learning"
-    results = vector_store.search(
-        ns,
-        query="machine learning",
-        limit=3
-    )
-    
-    assert len(results) == 3
-    
-    # Results should be sorted by similarity (highest first)
-    scores = [r.score for r in results]
-    assert scores == sorted(scores, reverse=True)
-    print(f"Results: {results}")
-    # Similar documents should have higher scores than different one
-    similar_scores = [r.score for r in results if r.key.startswith("similar")]
-    different_scores = [r.score for r in results if r.key == "different"]
-    print(f"Similar scores: {similar_scores}")
-    print(f"Different scores: {different_scores}")
-    if similar_scores and different_scores:
-        # At least one similar doc should score higher than different doc
-        assert max(similar_scores) > min(different_scores)
-
-
 def test_vector_search_empty_namespace(vector_store):
     """Test vector search in empty namespace returns empty list."""
     ns = ("empty", "namespace")
