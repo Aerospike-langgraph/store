@@ -158,6 +158,7 @@ def test_put_with_embedding(vector_store, aerospike_client):
             print("WARNING: embedding bin NOT found!")
         
         # Verify embedding was stored
+        print(f"embedding: {bins.get('embedding')}")
         assert "embedding" in bins, "Embedding bin should be present"
         assert isinstance(bins["embedding"], list), "Embedding should be a list"
         assert len(bins["embedding"]) == 128, "Embedding should have 128 dimensions"

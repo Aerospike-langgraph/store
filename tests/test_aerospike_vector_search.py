@@ -344,11 +344,12 @@ def test_vector_search_similarity_scores(vector_store):
     # Results should be sorted by similarity (highest first)
     scores = [r.score for r in results]
     assert scores == sorted(scores, reverse=True)
-    
+    print(f"Results: {results}")
     # Similar documents should have higher scores than different one
     similar_scores = [r.score for r in results if r.key.startswith("similar")]
     different_scores = [r.score for r in results if r.key == "different"]
-    
+    print(f"Similar scores: {similar_scores}")
+    print(f"Different scores: {different_scores}")
     if similar_scores and different_scores:
         # At least one similar doc should score higher than different doc
         assert max(similar_scores) > min(different_scores)
