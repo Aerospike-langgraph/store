@@ -185,12 +185,22 @@ class AerospikeStore(BaseStore):
     def _extract_text_for_embedding(
         self, value: dict[str, Any], 
         index: Literal[False] | list[str] | None
-    ) -> list[str]:
+    ) -> str:
         if index is None:
             index = self.fields
         elif index is False:
-            return []
-        return " ".join(get_text_at_path(value, index)).strip()
+            return ""
+        if isinstance(index, list) and len(index) == 1 and index[0] == "$":
+            path = "$"
+        elif isinstance(index, list) and len(index) == 1:
+            path = index[0]
+        elif isinstance(index, list):
+            path = index
+        else:
+            path = index
+        
+        texts = get_text_at_path(value, path)
+        return " ".join(texts).strip()
     # --------------- Base Functions --------------------
     
     def put(
@@ -240,10 +250,8 @@ class AerospikeStore(BaseStore):
 
         }                                                                           # Should we append here or just update
         self._put(p_key, bins, time_to_live)
-
         if self.embeddings:
             text = self._extract_text_for_embedding(value, index)
-            print(f"Text: {text}")
             if text:
                 embedding = self.embeddings.embed_query(text)
                 ops = [op.vector_write(self.vector_bin, embedding)]
@@ -391,7 +399,12 @@ class AerospikeStore(BaseStore):
             query_vector = self.embeddings.embed_query(query)
             query_obj = self.client.query(self.ns, self.set)
             query_obj.add_ops([
-                op.vector_distance(self.vector_bin, query_vector, element_type=1)
+                op.vector_distance(self.vector_bin, query_vector, element_type=1),
+                op.read("namespace"),
+                op.read("key"),
+                op.read("value"),
+                op.read("created_at"),
+                op.read("updated_at")
             ])
             filter_exprs = []
             if namespace_prefix:
