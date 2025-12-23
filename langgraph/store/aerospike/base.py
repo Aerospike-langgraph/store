@@ -266,7 +266,8 @@ class AerospikeStore(BaseStore):
             texts_to_embed = self._extract_texts_for_embedding(value, index)
             if texts_to_embed:
                 # Generate embedding
-                embeddings = self.embeddings.embed_documents(texts_to_embed)
+                combined_text = " ".join(texts_to_embed)
+                embeddings = self.embeddings.embed_documents([combined_text])
                 # Store vector using vector_write operation
                 try:
                     ops = [aero_op.vector_write(self.vector_bin, embeddings[0], element_type=1)]
@@ -480,10 +481,10 @@ class AerospikeStore(BaseStore):
         offset: int,
         refresh_ttl: Optional[bool],
     ) -> list[SearchItem]:
-        """Perform vector similarity search using brute-force scan.
+        """Perform vector similarity search using server-side top-k.
         
-        Note: This uses brute-force distance computation. For large datasets,
-        consider using vector secondary indexes when available.
+        Uses Aerospike's server-side top-k filtering for efficient k-NN search.
+        Suitable for large-scale datasets (millions of vectors).
         """
         # Generate query embedding
         query_embedding = self.embeddings.embed_query(query)
@@ -503,39 +504,48 @@ class AerospikeStore(BaseStore):
             final_expr = exp.And(*filter_exprs)
             policy["expressions"] = final_expr.compile()
         
-        # Scan all matching records
+        # Create query with vector distance operation
+        query_obj = self.client.query(self.ns, self.set)
+        query_obj.add_ops([aero_op.vector_distance(self.vector_bin, query_embedding, element_type=1)])
+        
+        # Enable server-side top-k filtering
+        # Request limit + offset to handle offset client-side
+        query_obj.set_topk(limit + offset, self.vector_bin, 0)  # 0 = ascending order
+        
+        # Collect results via callback
+        results = []
+        
+        def callback(record):
+            key, meta, bins = record
+            # Distance is in the bin returned by vector_distance operation
+            distance = bins.get(self.vector_bin)
+            
+            if distance is not None:
+                # Get the full record to extract metadata
+                # Note: query with ops returns only the operation results
+                try:
+                    _, _, full_bins = self.client.get(key)
+                    ns = tuple(full_bins.get("namespace", ()))
+                    k = full_bins.get("key")
+                    value = full_bins.get("value")
+                    created_at = full_bins.get("created_at", _now_utc().isoformat())
+                    updated_at = full_bins.get("updated_at", _now_utc().isoformat())
+                    
+                    results.append((distance, key, ns, k, value, created_at, updated_at))
+                except aerospike.exception.AerospikeError:
+                    # Record might have been deleted, skip
+                    pass
+            
+            return True
+        
+        # Execute query with server-side top-k
         try:
-            scan = self.client.scan(self.ns, self.set)
-            records = scan.results(policy=policy)
+            query_obj.foreach(callback, policy=policy)
         except aerospike.exception.AerospikeError as e:
             raise RuntimeError(f"Aerospike vector search failed: {e}") from e
         
-        # Compute distances for all records with vectors
-        distances = []
-        for pkey, _, bins in records:
-            ns = tuple(bins.get("namespace", ()))
-            key = bins.get("key")
-            value = bins.get("value")
-            created_at = bins.get("created_at", _now_utc())
-            updated_at = bins.get("updated_at", _now_utc())
-            
-            # Compute distance using vector_distance operation
-            try:
-                ops = [aero_op.vector_distance(self.vector_bin, query_embedding, element_type=1)]
-                _, _, result = self.client.operate(pkey, ops)
-                distance = result.get(self.vector_bin)
-                
-                if distance is not None:
-                    distances.append((distance, pkey, ns, key, value, created_at, updated_at))
-            except aerospike.exception.AerospikeError:
-                # Record doesn't have a vector, skip it
-                continue
-        
-        # Sort by distance (ascending - smaller distance = more similar)
-        distances.sort(key=lambda x: x[0])
-        
-        # Apply offset and limit
-        selected = distances[offset:offset + limit]
+        # Results are already sorted by server, just apply offset
+        selected = results[offset:]
         
         # Build SearchItem results with scores
         out = []
