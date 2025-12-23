@@ -3,6 +3,7 @@
 import aerospike
 import asyncio
 from aerospike_helpers import expressions as exp
+from aerospike_helpers.operations import operations as op
 from datetime import datetime, timezone
 from langgraph.store.base import (
     BaseStore,
@@ -21,7 +22,10 @@ from langgraph.store.base import (
     NotProvided,
     _ensure_refresh,
     _ensure_ttl,
-    _validate_namespace
+    _validate_namespace,
+    IndexConfig,
+    ensure_embeddings,
+    get_text_at_path
 )
 from collections.abc import Iterable
 from typing import (
@@ -48,13 +52,24 @@ class AerospikeStore(BaseStore):
         client : aerospike.Client,
         namespace : str = "langgraph",
         set : str = "store",
-        ttl_config: Optional[TTLConfig] = None
+        ttl_config: Optional[TTLConfig] = None,
+        index_config: Optional[IndexConfig] = None
     ) -> None:
         self.client = client
         self.ns = namespace
         self.set = set
         self.ttl_config = ttl_config
-    
+        self.index_config = {} if index_config is None else index_config
+
+        if self.index_config:
+            self.embeddings = ensure_embeddings(self.index_config.get("embed", None))
+            self.vector_bin = self.index_config.get("vector_bin", "embedding")
+            self.vector_dims = self.index_config.get("vector_dims")
+            self.fields = self.index_config.get("fields", None)
+            if self.fields is None:
+                self.fields = ["$"]
+        else: self.embeddings = None
+
     # --------------- Helper Functions ------------------
     def _key(self, namespace: tuple[str, ...], key: str) -> str:
         return (self.ns, self.set, SEP.join([*namespace, key]))
@@ -166,7 +181,16 @@ class AerospikeStore(BaseStore):
                 filter_exprs.append(exp.Eq(target_expr, exp.Val(condition)))
                 
         return filter_exprs
-    
+
+    def _extract_text_for_embedding(
+        self, value: dict[str, Any], 
+        index: Literal[False] | list[str] | None
+    ) -> list[str]:
+        if index is None:
+            index = self.fields
+        elif index is False:
+            return []
+        return " ".join(get_text_at_path(value, index)).strip()
     # --------------- Base Functions --------------------
     
     def put(
@@ -216,7 +240,17 @@ class AerospikeStore(BaseStore):
 
         }                                                                           # Should we append here or just update
         self._put(p_key, bins, time_to_live)
-        
+
+        if self.embeddings:
+            text = self._extract_text_for_embedding(value, index)
+            print(f"Text: {text}")
+            if text:
+                embedding = self.embeddings.embed_query(text)
+                ops = [op.vector_write(self.vector_bin, embedding)]
+                try:
+                    self.client.operate(p_key, ops)
+                except aerospike.exception.AerospikeError as e:
+                    raise RuntimeError(f"Aerospike vector write failed for {key}: {e}") from e
 
     def get(
         self, 
@@ -349,11 +383,78 @@ class AerospikeStore(BaseStore):
         **kwargs: Any,
     ) -> list[SearchItem]:                                    # Not taken Filter expressions into consideration
         if query:
-            raise NotImplementedError(
-                "Aerospike v0.1 does not support semantic/vector search. "
-                "Use search without query. "
-            )
-        
+            if not self.embeddings:
+                raise ValueError(
+                    "Vector search requires index_config with embeddings. "
+                    "Initialize store with index_config parameter."
+                )
+            query_vector = self.embeddings.embed_query(query)
+            query_obj = self.client.query(self.ns, self.set)
+            query_obj.add_ops([
+                op.vector_distance(self.vector_bin, query_vector, element_type=1)
+            ])
+            filter_exprs = []
+            if namespace_prefix:
+                prefix_conditions = self._build_path_filter(
+                    namespace_prefix, "namespace", is_suffix=False
+                )
+                filter_exprs.extend(prefix_conditions)
+            if filter:
+                filter_conditions = self._build_filter_exprs_from_dict(filter)
+                filter_exprs.extend(filter_conditions)
+            
+            policy = {}
+            if filter_exprs:
+                final_expr = exp.And(*filter_exprs)
+                policy["expressions"] = final_expr.compile()
+
+            query_obj.set_topk(limit, self.vector_bin, 0)
+            results = []
+            read_policy = self._build_read_policy_for_refresh(refresh_ttl)
+            if read_policy:
+                policy.update(read_policy)
+            
+            def collect_callback(record):
+                """Callback to collect query results."""
+                key, meta, bins = record
+                
+                # Extract distance from the vector bin (vector_distance returns distance here)
+                distance = bins.get(self.vector_bin)
+                if distance is None:
+                    return True  # Skip records without distance
+                
+                # Extract other fields
+                ns = tuple(bins.get("namespace", ()))
+                k = bins.get("key")
+                value = bins.get("value")
+                created_at = bins.get("created_at", _now_utc().isoformat())
+                updated_at = bins.get("updated_at", _now_utc().isoformat())
+                
+                similarity_score = 1.0 / (1.0 + float(distance)) if distance > 0 else 1.0
+                
+                results.append(SearchItem(
+                    namespace=ns,
+                    key=k,
+                    value=value,
+                    created_at=created_at,
+                    updated_at=updated_at,
+                    score=similarity_score
+                ))
+                return True
+            
+            try:
+                if policy:
+                    query_obj.foreach(collect_callback, policy)
+                else:
+                    query_obj.foreach(collect_callback)
+            except aerospike.exception.AerospikeError as e:
+                raise RuntimeError(f"Aerospike vector search failed: {e}") from e
+
+            if offset:
+                results = results[offset:]
+            
+            return results
+            
         filter_exprs = []
         if namespace_prefix:
             prefix_conditions = self._build_path_filter(namespace_prefix, "namespace", is_suffix=False)
@@ -434,6 +535,7 @@ class AerospikeStore(BaseStore):
                     namespace= op.namespace,
                     key= op.key,
                     value= op.value,
+                    index= op.index,
                     ttl= op.ttl
                 )
                 result.append(None)
@@ -442,6 +544,7 @@ class AerospikeStore(BaseStore):
                 result.append(
                     self.search(
                         op.namespace_prefix,
+                        query= op.query,
                         filter= op.filter,
                         limit= op.limit,
                         offset= op.offset
